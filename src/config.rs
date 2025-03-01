@@ -558,6 +558,14 @@ pub struct Pool {
     /// Close idle connections that have been opened for longer than this.
     pub idle_timeout: Option<u64>,
 
+    /// Maximum number of checkout failures a client is allowed before it
+    /// gets disconnected. This is needed to prevent persistent client/server
+    /// imbalance in high availability setups where multiple PgCat instances are placed
+    /// behind a single load balancer. If for any reason a client lands on a PgCat instance that has
+    /// a large number of connected clients, it might get stuck in perpetual checkout failure loop especially
+    /// in session mode
+    pub checkout_failure_limit: Option<u64>,
+
     /// Close server connections that have been opened for longer than this.
     /// Only applied to idle connections. If the connection is actively used for
     /// longer than this period, the pool will not interrupt it.
@@ -591,6 +599,18 @@ pub struct Pool {
 
     #[serde(default = "Pool::default_proxy")]
     pub proxy: bool,
+    // Support for query routing based on database activity
+    #[serde(default = "Pool::default_db_activity_based_routing")]
+    pub db_activity_based_routing: bool,
+
+    #[serde(default = "Pool::default_db_activity_init_delay")]
+    pub db_activity_init_delay: u64,
+
+    #[serde(default = "Pool::default_db_activity_ttl")]
+    pub db_activity_ttl: u64,
+
+    #[serde(default = "Pool::default_table_mutation_cache_ms_ttl")]
+    pub table_mutation_cache_ms_ttl: u64,
 
     pub plugins: Option<Plugins>,
     pub shards: BTreeMap<String, Shard>,
@@ -647,6 +667,25 @@ impl Pool {
 
     pub fn default_proxy() -> bool {
         false
+    }
+
+    pub fn default_db_activity_based_routing() -> bool {
+        false
+    }
+
+    pub fn default_db_activity_init_delay() -> u64 {
+        // 100 milliseconds
+        100
+    }
+
+    pub fn default_db_activity_ttl() -> u64 {
+        // 15 minutes
+        15 * 60
+    }
+
+    pub fn default_table_mutation_cache_ms_ttl() -> u64 {
+        // 50 milliseconds
+        50
     }
 
     pub fn validate(&mut self) -> Result<(), Error> {
@@ -731,6 +770,23 @@ impl Pool {
             user.validate()?;
         }
 
+        if self.db_activity_based_routing {
+            if self.db_activity_init_delay == 0 {
+                error!("db_activity_init_delay must be greater than 0");
+                return Err(Error::BadConfig);
+            }
+
+            if self.table_mutation_cache_ms_ttl == 0 {
+                error!("table_mutation_cache_ms_ttl must be greater than 0");
+                return Err(Error::BadConfig);
+            }
+
+            if self.db_activity_ttl == 0 {
+                error!("db_activity_ttl must be greater than 0");
+                return Err(Error::BadConfig);
+            }
+        }
+
         Ok(())
     }
 }
@@ -740,6 +796,7 @@ impl Default for Pool {
         Pool {
             pool_mode: Self::default_pool_mode(),
             load_balancing_mode: Self::default_load_balancing_mode(),
+            checkout_failure_limit: None,
             default_role: String::from("any"),
             query_parser_enabled: false,
             query_parser_max_length: None,
@@ -761,6 +818,10 @@ impl Default for Pool {
             log_client_parameter_status_changes: false,
             prepared_statements_cache_size: Self::default_prepared_statements_cache_size(),
             proxy: Self::default_proxy(),
+            db_activity_based_routing: Self::default_db_activity_based_routing(),
+            db_activity_init_delay: Self::default_db_activity_init_delay(),
+            db_activity_ttl: Self::default_db_activity_ttl(),
+            table_mutation_cache_ms_ttl: Self::default_table_mutation_cache_ms_ttl(),
             plugins: None,
             shards: BTreeMap::from([(String::from("1"), Shard::default())]),
             users: BTreeMap::default(),
@@ -1258,6 +1319,17 @@ impl Config {
                 None => self.general.idle_timeout,
             };
             info!("[pool: {}] Idle timeout: {}ms", pool_name, idle_timeout);
+            match pool_config.checkout_failure_limit {
+                Some(checkout_failure_limit) => {
+                    info!(
+                        "[pool: {}] Checkout failure limit: {}",
+                        pool_name, checkout_failure_limit
+                    );
+                }
+                None => {
+                    info!("[pool: {}] Checkout failure limit: not set", pool_name);
+                }
+            };
             info!(
                 "[pool: {}] Sharding function: {}",
                 pool_name,
@@ -1301,6 +1373,22 @@ impl Config {
             info!(
                 "[pool: {}] Cleanup server connections: {}",
                 pool_name, pool_config.cleanup_server_connections
+            );
+            info!(
+                "[pool: {}] DB activity based routing: {}",
+                pool_name, pool_config.db_activity_based_routing
+            );
+            info!(
+                "[pool: {}] DB activity init delay: {}",
+                pool_name, pool_config.db_activity_init_delay
+            );
+            info!(
+                "[pool: {}] DB activity TTL: {}",
+                pool_name, pool_config.db_activity_ttl
+            );
+            info!(
+                "[pool: {}] Table mutation cache TTL: {}",
+                pool_name, pool_config.table_mutation_cache_ms_ttl
             );
             info!(
                 "[pool: {}] Log client parameter status changes: {}",
